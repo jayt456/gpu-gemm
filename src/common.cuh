@@ -56,17 +56,19 @@ inline void matmul_cpu(const float *A, const float *B, float *C, int N)
     }
 }
 
-// Max relative error — never compare floats for exact equality.
+// Error normalized by the magnitude of the RESULT, not per-element.
+// Per-element relative error is meaningless for GEMM: sums of random-signed
+// products pass near zero by cancellation, so a tiny element with ordinary
+// float rounding reports an enormous "relative" error.
 inline double max_rel_err(const float *ref, const float *test, size_t n)
 {
-    double worst = 0.0;
+    double maxabs = 0.0, maxdiff = 0.0;
     for (size_t i = 0; i < n; ++i)
     {
-        double r = std::fabs((double)ref[i]);
-        double d = std::fabs((double)ref[i] - (double)test[i]);
-        worst = std::max(worst, d / (r > 1e-6 ? r : 1e-6));
+        maxabs = std::max(maxabs, std::fabs((double)ref[i]));
+        maxdiff = std::max(maxdiff, std::fabs((double)ref[i] - (double)test[i]));
     }
-    return worst;
+    return maxdiff / (maxabs > 1e-12 ? maxabs : 1.0);
 }
 
 inline double gflops(int N, double ms)
