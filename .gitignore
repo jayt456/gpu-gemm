@@ -1,0 +1,10 @@
+cat > .gitignore << 'EOF'
+bin/
+*.o
+*.out
+*.exe
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
+.vscode/
+EOF
