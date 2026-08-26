@@ -8,26 +8,29 @@ The point isn't to beat cuBLAS. It's that each kernel here removes one specific 
 bottleneck, the predicted effect was written down before the run, and the measurement
 either confirmed it or didn't. Where it didn't, that's in the README too.
 
+**Result:** the 2-D register-tiled kernel reaches **79% of cuBLAS** at N=4096 and **7.1×** a
+coalesced naive kernel, at 50% occupancy with zero register spills.
+
 Hardware: Tesla T4 (Turing, 40 SMs, `sm_75`) on Google Colab. CUDA 12.x.
 
 ![Benchmark](results/benchmark.png)
 
 ## Results at N = 4096
 
-<!-- TODO: refresh this table from results/results.csv after the run that includes
-     tiled8 / tiled16 / reg2d. Existing rows are from the previous run on the same T4. -->
-
 | Kernel | GFLOP/s | ms | vs. naive | % of cuBLAS | Arithmetic intensity |
 |---|---:|---:|---:|---:|---:|
-| `cpu` (i-k-j, `-O3`) | 10.6 *(at N=1024)* | — | — | 0.3% | — |
-| `naive_uncoal` | 120 | 1145.7 | 0.28× | 3.1% | 0.25 (scattered) |
-| `naive` | 422 | 325.5 | 1.00× | 11.0% | 0.25 |
-| `tiled8` | — | — | — | — | 2 |
-| `tiled16` | — | — | — | — | 4 |
-| `tiled32` | 836 | 164.3 | 1.98× | 21.7% | 8 |
-| `reg1d` | 1739 | 79.1 | 4.12× | 45.1% | 16 |
-| `reg2d` | — | — | — | — | 32 |
-| `cublas` | 3853 | 35.7 | 9.12× | 100% | — |
+| `cpu` (i-k-j, `-O3`) | 4.8 *(at N=1024)* | — | — | — | — |
+| `naive_uncoal` | 120 | 1147.2 | 0.28× | 3.1% | 0.25 (scattered) |
+| `naive` | 427 | 321.9 | 1.00× | 11.1% | 0.25 |
+| `tiled8` | 383 | 359.0 | 0.90× | 10.0% | 2 |
+| `tiled16` | 630 | 218.3 | 1.47× | 16.4% | 4 |
+| `tiled32` | 836 | 164.5 | 1.96× | 21.8% | 8 |
+| `reg1d` | 1725 | 79.7 | 4.04× | 44.9% | 16 |
+| **`reg2d`** | **3028** | **45.4** | **7.09×** | **78.9%** | **32** |
+| `cublas` | 3840 | 35.8 | 8.99× | 100% | — |
+
+All numbers are from a single run on one T4, median of 7 after a warm-up. Session-to-session
+variance across runs is around 3%, so treat the last digit as noise.
 
 Arithmetic intensity is FLOPs performed per byte read from DRAM. The T4 does about
 8.1 TFLOP/s of FP32 against 320 GB/s of bandwidth, so its balance point is roughly
@@ -46,7 +49,7 @@ baseline would have made every speedup number below meaningless, so it's worth g
 `C` are consecutive addresses and coalesce into full memory transactions. Intensity is
 0.25 FLOP/byte — two 4-byte loads to feed one multiply and one add.
 
-Naive roofline says `0.25 × 320 GB/s ≈ 80 GFLOP/s`. It measured 422. The gap is the L2
+Naive roofline says `0.25 × 320 GB/s ≈ 80 GFLOP/s`. It measured 427. The gap is the L2
 cache absorbing reuse that the intensity figure doesn't model, which is a useful reminder
 that the roofline bounds DRAM traffic, not total traffic.
 
@@ -55,7 +58,7 @@ The only change is one line: `threadIdx.x` maps to the row instead of the column
 warp's 32 addresses are `N` floats apart, so a single request scatters into 32 separate
 32-byte transactions, each delivering 4 useful bytes.
 
-Cost: **3.5×**, from nothing but the thread-to-data mapping. I kept this kernel in the repo
+Cost: **3.6×**, from nothing but the thread-to-data mapping. I kept this kernel in the repo
 deliberately. It's the only controlled experiment here where a single variable changes and
 everything else is held fixed, and it's the clearest evidence that coalescing is a real
 effect and not folklore.
@@ -71,9 +74,17 @@ while slower threads are still reading the current one. Omitting it gives an int
 race that returns wrong numbers and never crashes.
 
 **5. Tile-size sweep** (`tiled8`, `tiled16`, `tiled32`). Bigger tiles raise intensity but
-cost occupancy. `TILE=32` needs 1024 threads per block, which is Turing's per-*SM* thread
-limit, so exactly one block is resident and at every `__syncthreads()` the SM has nothing
-else to run. The optimum is a trade-off between two resources, and it's empirical.
+cost resident blocks, so the optimum is empirical. Two results worth having:
+
+**`tiled8` is slower than no tiling at all** — 383 vs. 427 GFLOP/s at N=4096, a 0.90×
+"speedup". Its intensity is 8× the naive kernel's, and it still loses. An 8×8 tile means
+only 8 iterations of useful work between two barriers, so barrier and index overhead eats
+the gain, and the naive kernel meanwhile gets a large uncounted assist from L2.
+
+**`tiled16` degrades with N while `tiled32` holds flat** — 855 → 658 → 630 GFLOP/s across
+N = 1024, 2048, 4096, against 863 → 866 → 836 for `tiled32`. At N=1024 the two are within
+1% of each other; by N=2048 `tiled32` is 32% ahead. As the working set grows, L2 captures a
+smaller share of the reuse, and the lower-intensity kernel is the one that suffers for it.
 
 **6. 1-D register tiling.** Tiling alone plateaus because the inner loop issues two
 shared-memory loads per FMA, and shared memory can't feed the ALUs at that ratio. So each
@@ -92,6 +103,11 @@ Two details make it actually fast rather than just theoretically better. `A` is 
 That in turn makes the shared-memory reads vectorizable as `float4`, which cuts the
 load instruction count 4× and sidesteps a bank conflict: with scalar loads, the 16 threads
 of a half-warp read `B` at 8-float strides and collide 4 ways on the same banks.
+
+Measured: **3,028 GFLOP/s, 78.9% of cuBLAS**, 1.76× over `reg1d`. The prediction going in
+was 1.5–2×. `ptxas` confirms the resource model too — **119 registers, 0 bytes spilled**,
+8 KB shared, which puts two blocks on an SM at 50% occupancy, exactly the trade the design
+was making.
 
 ## Negative results
 

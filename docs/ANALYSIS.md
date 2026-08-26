@@ -64,10 +64,12 @@ tile, not the per-thread tile. Doubling BM and BN doubles it; changing BK does n
 
 | Kernel | AI | DRAM roof (AI × 320 GB/s) | Measured @4096 | Fraction of its roof |
 |---|---:|---:|---:|---:|
-| `naive` | 0.25 | 80 | 422 | **5.3×** |
+| `naive` | 0.25 | 80 | 427 | **5.3×** |
+| `tiled8` | 2 | 640 | 383 | 0.60× |
+| `tiled16` | 4 | 1,280 | 630 | 0.49× |
 | `tiled32` | 8 | 2,560 | 836 | 0.33× |
-| `reg1d` | 16 | 5,120 | 1,739 | 0.34× |
-| `reg2d` | 32 | 8,100 (compute-capped) | *pending* | — |
+| `reg1d` | 16 | 5,120 | 1,725 | 0.34× |
+| `reg2d` | 32 | 8,100 (compute-capped) | 3,028 | 0.37× |
 
 Two things are wrong with a naive reading of this table, and both are informative.
 
@@ -76,11 +78,16 @@ load. It isn't — the 4 MB L2 catches a large fraction of the reuse for free. T
 bounds *DRAM* traffic, not total traffic, so it's a lower bound on performance for
 cache-friendly access patterns rather than an upper bound.
 
-**`tiled32` and `reg1d` fall far short of theirs.** If DRAM bandwidth were the binding
-constraint, they'd sit near their roofs. At a third of it, something else is the limit.
-This matters, because the obvious story — "AI doubled 8 → 16, throughput doubled
-836 → 1739" — is a correlation with the wrong mechanism attached. Both kernels are well
-clear of the DRAM roof. What actually changed is the next level down.
+**Everything from `tiled8` up falls far short of its roof.** If DRAM bandwidth were the
+binding constraint they would sit near it; instead they cluster at 0.33–0.60×. This matters,
+because the obvious story — "AI doubled 8 → 16, throughput doubled 836 → 1725" — is a
+correlation with the wrong mechanism attached. Both kernels are well clear of the DRAM
+roof. What actually changed is the next level down.
+
+Note also that the fraction-of-roof column is roughly *flat* from `tiled32` to `reg2d`
+(0.33 → 0.34 → 0.37). Doubling arithmetic intensity moved the roof and the measurement by
+about the same factor each time, which is what you would expect if the roof is not the
+thing being hit.
 
 ## 4. The shared-memory bottleneck
 
@@ -95,9 +102,11 @@ the FMA pipeline can retire arithmetic.
 | `k_reg2d`, scalar | 8 `A` + 8 `B` loads, 64 FMAs | 1 : 4 |
 | `k_reg2d`, `float4` | 2 + 2 `LDS.128`, 64 FMAs | 1 : 16 |
 
-The `tiled32` → `reg1d` step improves this ratio by ~1.8×, which tracks the measured 2.08×
-far more closely than the DRAM roofline does. The remaining difference is occupancy
-(§5).
+The `tiled32` → `reg1d` step improves this ratio by ~1.8×, against a measured 2.06×. The
+`reg1d` → `reg2d` step improves it by ~4.5× before vectorization and ~18× after, against a
+measured **1.76×** — so the load-to-FMA ratio stops being the binding constraint somewhere
+inside that step, which is consistent with `reg2d` being the first kernel whose intensity
+(32) clears the machine balance point (25).
 
 It also shows exactly what `reg1d` leaves on the table. Its 8 `A` values per k-step are
 each used once — all the register-level reuse is on the `B` side. The 2-D tile fixes the
@@ -119,6 +128,10 @@ for hiding memory latency: when a warp stalls, the scheduler switches to another
 | `reg1d` | 512 | 4 KB | 2 | 32 | 100% |
 | `reg2d` | 256 | 8 KB | 2 (register-limited) | 16 | 50% |
 
+**Measured** (`ptxas -v`, sm_75): `reg2d` uses **119 registers, 0 bytes spill stores, 0 spill
+loads, 8192 bytes smem**. 119 × 256 = 30,464 registers per block, so 65,536 / 30,464 = 2
+blocks resident — 16 warps, 50% occupancy, exactly as predicted above.
+
 `tiled32` is the interesting row. Its occupancy is 100% by the standard metric, so the
 usual "raise occupancy" advice doesn't apply. The problem is that all 32 resident warps
 belong to the *same block*, so they all hit `__syncthreads()` together and the SM stalls
@@ -127,10 +140,9 @@ staging phase can overlap the other's compute phase. Part of the `tiled32 → re
 is this, not intensity.
 
 `reg2d` trades the other way. 64 accumulators per thread plus `regA`/`regB` pushes register
-use to roughly 128 per thread, capping the SM at two blocks and 50% occupancy. That's the
-intended trade: the kernel is dense enough in arithmetic that it needs less latency hiding.
-**This is the first thing to check with `ncu`** — if the compiler spills to local memory the
-kernel will be slow for a reason that has nothing to do with any of the analysis above.
+use to 119 per thread, capping the SM at two blocks and 50% occupancy. That's the intended
+trade: the kernel is dense enough in arithmetic that it needs less latency hiding, and at
+3,028 GFLOP/s against `reg1d`'s 1,725 at full occupancy, the trade paid.
 
 ## 6. Memory access patterns
 
@@ -186,13 +198,22 @@ before it can be run. Three things carry the load:
    duplicate means a race.
 3. **The all-ones self-test at N=257**, described in the README, as the on-device gate.
 
+All three held: `k_reg2d` compiled and passed the gate on first contact with hardware, and
+its measured occupancy matched the prediction in §5 exactly.
+
 ## 8. Open questions
 
-- Confirm the cuBLAS dip at N=4096 is throttling, by sampling
-  `nvidia-smi --query-gpu=clocks.sm,temperature.gpu` during the run, or by running the
-  sizes in reverse order and seeing whether the dip follows the clock rather than the size.
+- Confirm the cuBLAS dip at N=4096 is throttling. It has now reproduced in three separate
+  sessions (39%, 36%, 32% drops from N=2048), so it is systematic. Sample
+  `nvidia-smi --query-gpu=clocks.sm,temperature.gpu` during the run, or run the sizes in
+  reverse and see whether the dip follows the clock rather than the size.
 - `ncu` per kernel: achieved occupancy, DRAM throughput as % of peak, and compute
   throughput as % of peak. The expected story is `naive` pinned near bandwidth peak with
   low compute utilization, and `reg2d` inverted. Colab's `ncu` support is inconsistent.
-- Check `reg2d` for register spills (`-Xptxas -v`) before drawing any conclusion from its
-  number.
+- Why does `tiled8` (383 GFLOP/s) lose to `naive` (427) despite 8× the arithmetic
+  intensity? Working hypothesis: only 8 iterations of useful work between two barriers, so
+  synchronization and index overhead dominate, while `naive` collects a large uncounted L2
+  assist. `ncu` on barrier stall percentage would settle it.
+- Why does `tiled16` decay with N (855 → 658 → 630) while `tiled32` stays flat
+  (863 → 866 → 836)? Consistent with L2 covering the lower-intensity kernel's traffic at
+  small N and progressively failing to as the working set grows.
