@@ -1,4 +1,3 @@
-cat > .gitignore << 'EOF'
 bin/
 *.o
 *.out
@@ -7,4 +6,4 @@ __pycache__/
 .ipynb_checkpoints/
 .DS_Store
 .vscode/
-EOF
+*.ncu-rep
