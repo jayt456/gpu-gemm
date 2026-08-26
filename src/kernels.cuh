@@ -1,14 +1,9 @@
 #pragma once
 #include <cuda_runtime.h>
 
-// ---------------------------------------------------------------------------
-// K1: NAIVE
-// One thread per output element.
-// threadIdx.x -> col, so consecutive threads in a warp read consecutive
-// addresses of B and write consecutive addresses of C  => COALESCED.
-// Bottleneck: every element of A is re-read from global memory N times.
-// Arithmetic intensity = 2 FLOP / 8 bytes = 0.25 FLOP/byte  (memory bound).
-// ---------------------------------------------------------------------------
+// One thread per output element. threadIdx.x -> col, so a warp reads consecutive
+// B and writes consecutive C. Every element of A is re-read from DRAM N times.
+// AI = 0.25 FLOP/byte.
 __global__ void k_naive(const float *__restrict__ A,
                         const float *__restrict__ B,
                         float *__restrict__ C, int N)
@@ -24,17 +19,14 @@ __global__ void k_naive(const float *__restrict__ A,
     }
 }
 
-// ---------------------------------------------------------------------------
-// K1b: NAIVE, UNCOALESCED  (experiment only — deliberately bad)
-// Identical arithmetic, but threadIdx.x -> row. Consecutive threads now touch
-// addresses N floats apart, so each warp access scatters across many memory
-// transactions. Used to isolate the cost of access pattern alone.
-// ---------------------------------------------------------------------------
+// Control experiment. Arithmetically identical to k_naive; only threadIdx.x -> row
+// changes, so a warp's addresses stride by N. Isolates access pattern as the one
+// variable. Deliberately slow -- do not "fix".
 __global__ void k_naive_uncoalesced(const float *__restrict__ A,
                                     const float *__restrict__ B,
                                     float *__restrict__ C, int N)
 {
-    int row = blockIdx.x * blockDim.x + threadIdx.x; // <-- swapped
+    int row = blockIdx.x * blockDim.x + threadIdx.x; // swapped
     int col = blockIdx.y * blockDim.y + threadIdx.y;
     if (row < N && col < N)
     {
@@ -45,19 +37,9 @@ __global__ void k_naive_uncoalesced(const float *__restrict__ A,
     }
 }
 
-// ---------------------------------------------------------------------------
-// K2: SHARED-MEMORY TILED
-// Each block stages a TILE x TILE sub-block of A and B into shared memory,
-// then reuses it TILE times. Global traffic drops from O(N^3) to O(N^3/TILE).
-// Arithmetic intensity = TILE/4 FLOP/byte (8.0 at TILE=32) — a 32x improvement.
-//
-// Two __syncthreads() are required:
-//   (1) after loading  — no thread may read a tile before all threads wrote it
-//   (2) after computing — no thread may overwrite a tile before all threads
-//       finished reading it. Omitting (2) is a silent, intermittent race.
-//
+// The block stages a TILE x TILE sub-block of A and B into shared memory and
+// reuses each staged value TILE times. AI = TILE/4 FLOP/byte.
 // Out-of-range loads are zero-filled, so N need not be a multiple of TILE.
-// ---------------------------------------------------------------------------
 template <int TILE>
 __global__ void k_tiled(const float *__restrict__ A,
                         const float *__restrict__ B,
@@ -80,34 +62,29 @@ __global__ void k_tiled(const float *__restrict__ A,
 
         As[ty][tx] = (row < N && aCol < N) ? A[(size_t)row * N + aCol] : 0.0f;
         Bs[ty][tx] = (bRow < N && col < N) ? B[(size_t)bRow * N + col] : 0.0f;
-        __syncthreads(); // (1) tiles are loaded
+        __syncthreads(); // tile is staged
 
 #pragma unroll
         for (int k = 0; k < TILE; ++k)
             acc += As[ty][k] * Bs[k][tx];
-        __syncthreads(); // (2) everyone done reading
+        __syncthreads(); // everyone done reading before it is overwritten
     }
 
     if (row < N && col < N)
         C[(size_t)row * N + col] = acc;
 }
 
-// ---------------------------------------------------------------------------
-// K3: REGISTER-TILED (1D thread coarsening)
-// Shared-memory tiling alone tops out around TILE/4 FLOP/byte, still short of
-// the ~13 FLOP/byte modern GPUs need to be compute bound. The next lever is to
-// give each thread MORE WORK: here each thread computes TM output elements
-// (a vertical strip), accumulating in registers — the fastest storage there is.
-// One value of B loaded from shared memory now feeds TM multiply-adds.
-//
-// Config: BM=BN=64, BK=8, TM=8  ->  blockDim.x = BM*BN/TM = 512 threads.
-//   As holds BM*BK = 512 floats, Bs holds BK*BN = 512  -> one load per thread.
-// ---------------------------------------------------------------------------
+// Each thread computes TM outputs (a column strip) in registers, so one B value
+// from shared memory feeds TM FMAs instead of one. AI = 16 FLOP/byte.
+// At 64,64,8,8 every thread stages exactly one element of each tile.
 template <int BM, int BN, int BK, int TM>
 __global__ void k_reg1d(const float *__restrict__ A,
                         const float *__restrict__ B,
                         float *__restrict__ C, int N)
 {
+    static_assert(BM * BK == BM * BN / TM, "As staging is not one load/thread");
+    static_assert(BK * BN == BM * BN / TM, "Bs staging is not one load/thread");
+
     __shared__ float As[BM * BK];
     __shared__ float Bs[BK * BN];
 
@@ -115,11 +92,9 @@ __global__ void k_reg1d(const float *__restrict__ A,
     const int cRow = blockIdx.y * BM;
     const int cCol = blockIdx.x * BN;
 
-    // compute mapping: this thread owns column `threadCol`, rows [threadRow*TM, +TM)
-    const int threadCol = tid % BN; // 0 .. BN-1
-    const int threadRow = tid / BN; // 0 .. BM/TM-1
+    const int threadCol = tid % BN; // owns this column
+    const int threadRow = tid / BN; // owns rows [threadRow*TM, +TM)
 
-    // load mapping (one element each)
     const int aRow = tid / BK, aCol = tid % BK; // As is BM x BK
     const int bRow = tid / BN, bCol = tid % BN; // Bs is BK x BN
 
@@ -157,5 +132,113 @@ __global__ void k_reg1d(const float *__restrict__ A,
         const int c = cCol + threadCol;
         if (r < N && c < N)
             C[(size_t)r * N + c] = acc[m];
+    }
+}
+
+// Each thread computes a TM x TN block via an outer product per k-step, so
+// TM + TN shared loads feed TM*TN FMAs (16 -> 64 at 8x8, vs 9 -> 8 in k_reg1d).
+// AI = 32 FLOP/byte, past the T4's 25 FLOP/byte balance point.
+//
+// As is staged transposed so the compute loop reads a column of A contiguously,
+// which is what makes the float4 shared reads below possible. Global loads stay
+// scalar so the bounds guards still hold for any N.
+template <int BM, int BN, int BK, int TM, int TN>
+__global__ void k_reg2d(const float *__restrict__ A,
+                        const float *__restrict__ B,
+                        float *__restrict__ C, int N)
+{
+    constexpr int nThreads = BM * BN / (TM * TN);
+    constexpr int strideA = nThreads / BK; // rows of As staged per pass
+    constexpr int strideB = nThreads / BN; // rows of Bs staged per pass
+
+    static_assert(TM % 4 == 0 && TN % 4 == 0, "float4 reads need TM,TN % 4 == 0");
+    static_assert(nThreads % BK == 0 && nThreads % BN == 0, "bad staging map");
+    static_assert(strideA > 0 && strideB > 0, "block too small to stage a tile");
+    static_assert(BM % strideA == 0 && BK % strideB == 0, "staging leaves holes");
+
+    __shared__ __align__(16) float As[BK * BM]; // transposed: As[k][row]
+    __shared__ __align__(16) float Bs[BK * BN];
+
+    const int tid = threadIdx.x;
+    const int cRow = blockIdx.y * BM;
+    const int cCol = blockIdx.x * BN;
+
+    const int threadCol = tid % (BN / TN); // owns cols [threadCol*TN, +TN)
+    const int threadRow = tid / (BN / TN); // owns rows [threadRow*TM, +TM)
+
+    const int aCol = tid % BK, aRow = tid / BK;
+    const int bCol = tid % BN, bRow = tid / BN;
+
+    float acc[TM][TN];
+    float regA[TM], regB[TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j)
+            acc[i][j] = 0.0f;
+
+    for (int t = 0; t < N; t += BK)
+    {
+#pragma unroll
+        for (int off = 0; off < BM; off += strideA)
+        {
+            const int r = aRow + off;
+            const int gr = cRow + r, gc = t + aCol;
+            As[aCol * BM + r] =
+                (gr < N && gc < N) ? A[(size_t)gr * N + gc] : 0.0f;
+        }
+#pragma unroll
+        for (int off = 0; off < BK; off += strideB)
+        {
+            const int r = bRow + off;
+            const int gr = t + r, gc = cCol + bCol;
+            Bs[r * BN + bCol] =
+                (gr < N && gc < N) ? B[(size_t)gr * N + gc] : 0.0f;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int k = 0; k < BK; ++k)
+        {
+            // Unpacked element-wise rather than via *(float4*)&regA[i]: taking the
+            // address of a local array can push it out of registers into local memory.
+#pragma unroll
+            for (int i = 0; i < TM; i += 4)
+            {
+                const float4 v = *reinterpret_cast<const float4 *>(
+                    &As[k * BM + threadRow * TM + i]);
+                regA[i] = v.x; regA[i + 1] = v.y;
+                regA[i + 2] = v.z; regA[i + 3] = v.w;
+            }
+#pragma unroll
+            for (int j = 0; j < TN; j += 4)
+            {
+                const float4 v = *reinterpret_cast<const float4 *>(
+                    &Bs[k * BN + threadCol * TN + j]);
+                regB[j] = v.x; regB[j + 1] = v.y;
+                regB[j + 2] = v.z; regB[j + 3] = v.w;
+            }
+#pragma unroll
+            for (int i = 0; i < TM; ++i)
+#pragma unroll
+                for (int j = 0; j < TN; ++j)
+                    acc[i][j] += regA[i] * regB[j];
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+    {
+        const int r = cRow + threadRow * TM + i;
+        if (r >= N)
+            continue;
+#pragma unroll
+        for (int j = 0; j < TN; ++j)
+        {
+            const int c = cCol + threadCol * TN + j;
+            if (c < N)
+                C[(size_t)r * N + c] = acc[i][j];
+        }
     }
 }

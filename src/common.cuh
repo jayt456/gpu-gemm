@@ -37,8 +37,8 @@ inline void fill_random(float *m, size_t n, unsigned seed)
         m[i] = (float)rand() / RAND_MAX * 2.0f - 1.0f; // [-1, 1]
 }
 
-// CPU reference. i-k-j ordering: the inner loop walks B and C contiguously,
-// which is far more cache-friendly than the textbook i-j-k.
+// i-k-j ordering: the inner loop walks B and C contiguously, unlike the
+// textbook i-j-k which strides down a column of B.
 inline void matmul_cpu(const float *A, const float *B, float *C, int N)
 {
     for (int i = 0; i < N; ++i)
@@ -56,10 +56,9 @@ inline void matmul_cpu(const float *A, const float *B, float *C, int N)
     }
 }
 
-// Error normalized by the magnitude of the RESULT, not per-element.
-// Per-element relative error is meaningless for GEMM: sums of random-signed
-// products pass near zero by cancellation, so a tiny element with ordinary
-// float rounding reports an enormous "relative" error.
+// Normalized by the magnitude of the RESULT, not per-element: GEMM outputs are
+// sums of random-signed products, so many land near zero by cancellation and a
+// per-element ratio reports a huge error for a correctly-rounded number.
 inline double max_rel_err(const float *ref, const float *test, size_t n)
 {
     double maxabs = 0.0, maxdiff = 0.0;
