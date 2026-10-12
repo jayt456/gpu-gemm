@@ -25,9 +25,9 @@ Hardware: Tesla T4 (Turing, 40 SMs, `sm_75`) on Google Colab, CUDA 12.x.
 
 ![Benchmark](results/benchmark.png)
 
-## Results at N = 4096
+## All kernels at N = 4096
 
-| Kernel | Idea | GFLOP/s | vs. naive | % of cuBLAS | AI |
+| Kernel | Idea | GFLOP/s | vs. naive | % of cuBLAS* | AI |
 |---|---|---:|---:|---:|---:|
 | `cpu` | i-k-j loop order, `-O3` | 4.8 *(N=1024)* | — | — | — |
 | `naive_uncoal` | control: `threadIdx.x` → row | 120 | 0.28× | 3.1% | 0.25 |
