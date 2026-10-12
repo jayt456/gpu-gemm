@@ -75,8 +75,9 @@ Two things are wrong with a naive reading of this table, and both are informativ
 
 **`naive` beats its roofline by 5×.** The intensity figure counts every load as a DRAM
 load. It isn't — the 4 MB L2 catches a large fraction of the reuse for free. The roofline
-bounds *DRAM* traffic, not total traffic, so it's a lower bound on performance for
-cache-friendly access patterns rather than an upper bound.
+bounds *DRAM* traffic, not total traffic, so for cache-friendly access patterns the DRAM-only 
+intensity underestimates the kernel’s real intensity, and the measured point can land 
+above the roof.
 
 **Everything from `tiled8` up falls far short of its roof.** If DRAM bandwidth were the
 binding constraint they would sit near it; instead they cluster at 0.33–0.60×. This matters,
@@ -163,7 +164,7 @@ consumed, so no bandwidth is wasted. Requires `N % 8 == 0` for the sectors to be
 at other sizes some transactions straddle a boundary.
 
 The 12.5% row is `naive_uncoal`: each transaction hauls 32 bytes to deliver 4. Theory says
-8× worse; measured is 3.5×, and the difference is L2 recovering some of the scatter.
+8× worse; measured is 3.6×, and the difference is L2 recovering some of the scatter.
 
 **Shared-memory bank conflicts.** 32 banks, 4 bytes wide, interleaved by word address.
 
