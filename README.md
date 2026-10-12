@@ -8,8 +8,18 @@ The point isn't to beat cuBLAS. It's that each kernel removes one specific hardw
 bottleneck, the predicted effect was written down before the run, and the measurement
 either confirmed it or didn't. Where it didn't, that's in here too.
 
-**Result:** the 2-D register-tiled kernel reaches **79% of cuBLAS** at N=4096 and **7.1×**
-a coalesced naive kernel, at 50% occupancy with zero register spills.
+**Result:** the 2-D register-tiled kernel reaches **60% of cuBLAS at N=2048** and
+**7.8×** a coalesced naive kernel, at 50% occupancy with zero register spills.
+
+| N | `reg2d` GFLOP/s | cuBLAS GFLOP/s | % of cuBLAS |
+|---:|---:|---:|---:|
+| 1024 | 3,004 | 5,704 | 53% |
+| 2048 | 3,383 | 5,634 | **60%** |
+| 4096 | 3,028 | 3,840 | 79%* |
+
+\*cuBLAS drops ~32% at N=4096 while every other kernel holds steady, most likely
+thermal throttling (see [Negative results](#negative-results)). The N=2048 figure
+is the fair comparison.
 
 Hardware: Tesla T4 (Turing, 40 SMs, `sm_75`) on Google Colab, CUDA 12.x.
 
